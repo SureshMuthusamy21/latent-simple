@@ -39,7 +39,7 @@ class APIConfig:
     """API Configuration - matches inference.py defaults"""
     UNET_CONFIG_PATH = "configs/unet/stage2_512.yaml"
     INFERENCE_CKPT_PATH = "checkpoints/latentsync_unet.pt"
-    TEMP_BASE_DIR = "temp_api"  # Different from 'temp' used by util.py!
+    TEMP_BASE_DIR = "temp"  # MUST match Gradio for correct pipeline processing
     MAX_VIDEO_SIZE_MB = 500
     MAX_AUDIO_SIZE_MB = 50
     ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".webm"}
@@ -404,6 +404,7 @@ async def create_lipsync(
         
         def run_inference():
             # Use absolute paths as strings (native Windows format)
+            # CRITICAL: temp_dir must be "temp" to match Gradio and avoid artifacts
             engine.process(
                 video_path=str(video_path.absolute()),
                 audio_path=str(audio_path.absolute()),
@@ -412,7 +413,7 @@ async def create_lipsync(
                 guidance_scale=guidance_scale,
                 seed=seed,
                 enable_deepcache=enable_deepcache,
-                temp_dir=str((request_dir / "processing").absolute())
+                temp_dir="temp"  # Simple relative path like Gradio
             )
         
         # Run in thread pool to avoid blocking
