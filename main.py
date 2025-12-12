@@ -39,7 +39,7 @@ class APIConfig:
     """API Configuration - matches inference.py defaults"""
     UNET_CONFIG_PATH = "configs/unet/stage2_512.yaml"
     INFERENCE_CKPT_PATH = "checkpoints/latentsync_unet.pt"
-    TEMP_BASE_DIR = "temp"  # MUST match Gradio for correct pipeline processing
+    TEMP_BASE_DIR = "temp_api"  # CRITICAL: Different from 'temp' used by pipeline!
     MAX_VIDEO_SIZE_MB = 500
     MAX_AUDIO_SIZE_MB = 50
     ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".webm"}
