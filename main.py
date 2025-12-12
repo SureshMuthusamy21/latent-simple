@@ -321,18 +321,16 @@ async def create_lipsync(
 ):
     """
     Generate lip-synced video from input video and audio.
-    
     Returns the processed video file directly for download.
     """
     request_id = str(uuid.uuid4())[:8]
-    request_dir = None
+    temp_files = []
     
     try:
         # ========================================================================
         # 1. Validate inputs
         # ========================================================================
         
-        # Validate video
         if not validate_file_extension(video.filename, APIConfig.ALLOWED_VIDEO_EXTENSIONS):
             raise HTTPException(
                 status_code=400,
@@ -345,7 +343,6 @@ async def create_lipsync(
                 detail=f"Video file too large. Max size: {APIConfig.MAX_VIDEO_SIZE_MB}MB"
             )
         
-        # Validate audio
         if not validate_file_extension(audio.filename, APIConfig.ALLOWED_AUDIO_EXTENSIONS):
             raise HTTPException(
                 status_code=400,
@@ -359,22 +356,25 @@ async def create_lipsync(
             )
         
         # ========================================================================
-        # 2. Create temporary directory for this request (ABSOLUTE PATH)
+        # 2. CRITICAL FIX: Save files directly in temp/ root with unique names
+        #    This matches Gradio's behavior and prevents subdirectory mismatch
         # ========================================================================
         
-        # Use absolute path to avoid path resolution issues
         base_dir = Path(APIConfig.TEMP_BASE_DIR).resolve()
-        request_dir = base_dir / request_id
-        request_dir.mkdir(parents=True, exist_ok=True)
+        base_dir.mkdir(parents=True, exist_ok=True)
         
-        # Define paths with absolute paths
-        video_path = request_dir / f"input_video{Path(video.filename).suffix}"
-        audio_path = request_dir / f"input_audio{Path(audio.filename).suffix}"
-        output_path = request_dir / "output.mp4"
+        # Create unique filenames in temp root (not subdirectory!)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path = base_dir / f"{request_id}_{timestamp}_input{Path(video.filename).suffix}"
+        audio_path = base_dir / f"{request_id}_{timestamp}_audio{Path(audio.filename).suffix}"
+        output_path = base_dir / f"{request_id}_{timestamp}_output.mp4"
         
-        logger.info(f"[{request_id}] Request directory: {request_dir}")
+        # Track files for cleanup
+        temp_files = [video_path, audio_path, output_path]
+        
         logger.info(f"[{request_id}] Video path: {video_path}")
         logger.info(f"[{request_id}] Audio path: {audio_path}")
+        logger.info(f"[{request_id}] Output path: {output_path}")
         
         # ========================================================================
         # 3. Save uploaded files
@@ -384,36 +384,30 @@ async def create_lipsync(
         await save_upload_file(video, video_path)
         await save_upload_file(audio, audio_path)
         
-        # Double-check files exist
+        # Verify files exist
         if not video_path.exists():
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save video file to {video_path}"
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to save video file")
         if not audio_path.exists():
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to save audio file to {audio_path}"
-            )
+            raise HTTPException(status_code=500, detail=f"Failed to save audio file")
         
         # ========================================================================
-        # 4. Run inference in thread pool (blocking operation)
+        # 4. Run inference - files and temp_dir are now in SAME directory!
         # ========================================================================
         
         logger.info(f"[{request_id}] Starting inference...")
         
         def run_inference():
-            # Use absolute paths as strings (native Windows format)
-            # CRITICAL: temp_dir must be "temp" to match Gradio and avoid artifacts
+            # CRITICAL: Both input files AND temp_dir are now in "temp/"
+            # This allows the pipeline to find intermediate files (crops/masks/frames)
             engine.process(
-                video_path=str(video_path.absolute()),
-                audio_path=str(audio_path.absolute()),
-                video_out_path=str(output_path.absolute()),
+                video_path=str(video_path),
+                audio_path=str(audio_path),
+                video_out_path=str(output_path),
                 inference_steps=inference_steps,
                 guidance_scale=guidance_scale,
                 seed=seed,
                 enable_deepcache=enable_deepcache,
-                temp_dir="temp"  # Simple relative path like Gradio
+                temp_dir="temp"  # Same directory as input files!
             )
         
         # Run in thread pool to avoid blocking
@@ -434,33 +428,36 @@ async def create_lipsync(
         # 6. Return file response
         # ========================================================================
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_filename = f"lipsync_output_{timestamp}.mp4"
         
         logger.info(f"[{request_id}] ✅ Returning output file: {output_filename}")
         
         return FileResponse(
-            path=str(output_path.absolute()),
+            path=str(output_path),
             media_type="video/mp4",
             filename=output_filename,
-            background=None  # Don't delete yet, will cleanup later
+            background=None
         )
         
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
         
     except Exception as e:
-        logger.error(f"[{request_id}] ❌ Error during processing: {e}", exc_info=True)
+        logger.error(f"[{request_id}] ❌ Error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
         
     finally:
-        # Cleanup temp directory after a delay (5 minutes)
-        # This allows the FileResponse to complete
-        if request_dir:
+        # Cleanup individual files after delay (not directory)
+        if temp_files:
             async def delayed_cleanup():
                 await asyncio.sleep(300)  # 5 minutes
-                cleanup_temp_directory(str(request_dir))
+                for file_path in temp_files:
+                    try:
+                        if file_path.exists():
+                            file_path.unlink()
+                            logger.info(f"🧹 Deleted: {file_path.name}")
+                    except Exception as e:
+                        logger.warning(f"Cleanup failed for {file_path.name}: {e}")
             
             asyncio.create_task(delayed_cleanup())
 
