@@ -152,4 +152,9 @@ with gr.Blocks(title="LatentSync demo") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch(inbrowser=True, share=True)
+    demo.launch(
+    server_name="0.0.0.0",   # listens on all interfaces
+    server_port=7860,        # you can set any open port
+    share=False,             # disables Gradio tunnel
+    inbrowser=False          # EC2 cannot auto-open browser
+)
