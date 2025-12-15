@@ -1,4 +1,3 @@
-#working code api
 """
 FastAPI server for LatentSync Lip-Sync API
 Wraps the existing inference pipeline without modifying core logic
