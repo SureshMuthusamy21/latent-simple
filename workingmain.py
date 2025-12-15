@@ -556,6 +556,7 @@ class APIConfig:
     ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".webm"}
     ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac"}
     S3_BUCKET_NAME = "prod-video-gen-avatar-storage"
+    AWS_REGION = "us-east-1"  # AWS region for S3 and Polly
 
 # ============================================================================
 # S3 Helper
@@ -565,7 +566,7 @@ def download_video_from_s3(bucket_name: str, key: str, destination: Path) -> Non
     """Download video from S3"""
     try:
         logger.info(f"Downloading {key} from S3 bucket {bucket_name}...")
-        s3_client = boto3.client('s3')
+        s3_client = boto3.client('s3', region_name=APIConfig.AWS_REGION)
         destination.parent.mkdir(parents=True, exist_ok=True)
         s3_client.download_file(bucket_name, key, str(destination))
         
@@ -599,7 +600,7 @@ def generate_audio_with_polly(text: str, destination: Path) -> None:
     """Generate audio from text using AWS Polly"""
     try:
         logger.info("Generating audio with AWS Polly...")
-        polly_client = boto3.client('polly')
+        polly_client = boto3.client('polly', region_name=APIConfig.AWS_REGION)
         
         response = polly_client.synthesize_speech(
             Text=text,
