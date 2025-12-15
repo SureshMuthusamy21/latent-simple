@@ -719,7 +719,8 @@ def generate_audio_with_polly(text: str, voice_id: str, destination: Path) -> No
         response = polly_client.synthesize_speech(
             Text=text,
             OutputFormat='mp3',
-            VoiceId=voice_id
+            VoiceId=voice_id,
+            Engine='neural'
         )
         
         destination.parent.mkdir(parents=True, exist_ok=True)
