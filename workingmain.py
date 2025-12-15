@@ -20,6 +20,7 @@ import torch
 from omegaconf import OmegaConf
 from diffusers import AutoencoderKL, DDIMScheduler
 from accelerate.utils import set_seed
+import boto3
 
 # Import from existing codebase
 from latentsync.models.unet import UNet3DConditionModel
@@ -44,6 +45,30 @@ class APIConfig:
     MAX_AUDIO_SIZE_MB = 50
     ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".webm"}
     ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac"}
+    S3_BUCKET_NAME = "prod-video-gen-avatar-storage"
+    S3_VIDEO_KEY = "reya.mp4"
+
+# ============================================================================
+# S3 Helper
+# ============================================================================
+
+def download_video_from_s3(bucket_name: str, key: str, destination: Path) -> None:
+    """Download video from S3"""
+    try:
+        logger.info(f"Downloading {key} from S3 bucket {bucket_name}...")
+        s3_client = boto3.client('s3')
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        s3_client.download_file(bucket_name, key, str(destination))
+        
+        if not destination.exists():
+            raise RuntimeError(f"Failed to download file from S3")
+        
+        file_size = destination.stat().st_size
+        logger.info(f"Downloaded {destination.name}: {file_size / 1024:.2f} KB")
+        
+    except Exception as e:
+        logger.error(f"Error downloading from S3: {e}")
+        raise
 
 # ============================================================================
 # Inference Engine Singleton (Models loaded once at startup)
@@ -312,7 +337,6 @@ async def health_check():
 
 @app.post("/api/v1/lipsync")
 async def create_lipsync(
-    video: UploadFile = File(..., description="Input video file"),
     audio: UploadFile = File(..., description="Input audio file"),
     inference_steps: int = Form(20, description="Number of inference steps (default: 20)"),
     guidance_scale: float = Form(1.0, description="Guidance scale (default: 1.0)"),
@@ -320,7 +344,7 @@ async def create_lipsync(
     enable_deepcache: bool = Form(False, description="Enable DeepCache optimization")
 ):
     """
-    Generate lip-synced video from input video and audio.
+    Generate lip-synced video from S3 video and uploaded audio.
     Returns the processed video file directly for download.
     """
     request_id = str(uuid.uuid4())[:8]
@@ -328,20 +352,8 @@ async def create_lipsync(
     
     try:
         # ========================================================================
-        # 1. Validate inputs
+        # 1. Validate audio input
         # ========================================================================
-        
-        if not validate_file_extension(video.filename, APIConfig.ALLOWED_VIDEO_EXTENSIONS):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid video format. Allowed: {APIConfig.ALLOWED_VIDEO_EXTENSIONS}"
-            )
-        
-        if not validate_file_size(video, APIConfig.MAX_VIDEO_SIZE_MB):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Video file too large. Max size: {APIConfig.MAX_VIDEO_SIZE_MB}MB"
-            )
         
         if not validate_file_extension(audio.filename, APIConfig.ALLOWED_AUDIO_EXTENSIONS):
             raise HTTPException(
@@ -356,20 +368,17 @@ async def create_lipsync(
             )
         
         # ========================================================================
-        # 2. CRITICAL FIX: Save files directly in temp/ root with unique names
-        #    This matches Gradio's behavior and prevents subdirectory mismatch
+        # 2. Setup paths
         # ========================================================================
         
         base_dir = Path(APIConfig.TEMP_BASE_DIR).resolve()
         base_dir.mkdir(parents=True, exist_ok=True)
         
-        # Create unique filenames in temp root (not subdirectory!)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        video_path = base_dir / f"{request_id}_{timestamp}_input{Path(video.filename).suffix}"
+        video_path = base_dir / f"{request_id}_{timestamp}_input.mp4"
         audio_path = base_dir / f"{request_id}_{timestamp}_audio{Path(audio.filename).suffix}"
         output_path = base_dir / f"{request_id}_{timestamp}_output.mp4"
         
-        # Track files for cleanup
         temp_files = [video_path, audio_path, output_path]
         
         logger.info(f"[{request_id}] Video path: {video_path}")
@@ -377,28 +386,35 @@ async def create_lipsync(
         logger.info(f"[{request_id}] Output path: {output_path}")
         
         # ========================================================================
-        # 3. Save uploaded files
+        # 3. Download video from S3 and save audio
         # ========================================================================
         
-        logger.info(f"[{request_id}] Saving uploaded files...")
-        await save_upload_file(video, video_path)
+        logger.info(f"[{request_id}] Downloading video from S3...")
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            download_video_from_s3,
+            APIConfig.S3_BUCKET_NAME,
+            APIConfig.S3_VIDEO_KEY,
+            video_path
+        )
+        
+        logger.info(f"[{request_id}] Saving uploaded audio...")
         await save_upload_file(audio, audio_path)
         
         # Verify files exist
         if not video_path.exists():
-            raise HTTPException(status_code=500, detail=f"Failed to save video file")
+            raise HTTPException(status_code=500, detail=f"Failed to download video from S3")
         if not audio_path.exists():
             raise HTTPException(status_code=500, detail=f"Failed to save audio file")
         
         # ========================================================================
-        # 4. Run inference - files and temp_dir are now in SAME directory!
+        # 4. Run inference
         # ========================================================================
         
         logger.info(f"[{request_id}] Starting inference...")
         
         def run_inference():
-            # CRITICAL: Both input files AND temp_dir are now in "temp/"
-            # This allows the pipeline to find intermediate files (crops/masks/frames)
             engine.process(
                 video_path=str(video_path),
                 audio_path=str(audio_path),
@@ -407,11 +423,9 @@ async def create_lipsync(
                 guidance_scale=guidance_scale,
                 seed=seed,
                 enable_deepcache=enable_deepcache,
-                temp_dir="temp"  # Same directory as input files!
+                temp_dir="temp"
             )
         
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_inference)
         
         # ========================================================================
@@ -447,7 +461,7 @@ async def create_lipsync(
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
         
     finally:
-        # Cleanup individual files after delay (not directory)
+        # Cleanup individual files after delay
         if temp_files:
             async def delayed_cleanup():
                 await asyncio.sleep(300)  # 5 minutes
