@@ -12,6 +12,7 @@
 # from typing import Optional
 # import logging
 # from contextlib import asynccontextmanager
+# import io
 
 # from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 # from fastapi.responses import FileResponse, JSONResponse
@@ -21,6 +22,7 @@
 # from diffusers import AutoencoderKL, DDIMScheduler
 # from accelerate.utils import set_seed
 # import boto3
+# import docx
 
 # # Import from existing codebase
 # from latentsync.models.unet import UNet3DConditionModel
@@ -46,7 +48,7 @@
 #     ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".webm"}
 #     ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac"}
 #     S3_BUCKET_NAME = "prod-video-gen-avatar-storage"
-#     S3_VIDEO_KEY = "reya.mp4"
+#     AWS_REGION = "us-east-1"  # AWS region for S3 and Polly
 
 # # ============================================================================
 # # S3 Helper
@@ -56,7 +58,7 @@
 #     """Download video from S3"""
 #     try:
 #         logger.info(f"Downloading {key} from S3 bucket {bucket_name}...")
-#         s3_client = boto3.client('s3')
+#         s3_client = boto3.client('s3', region_name=APIConfig.AWS_REGION)
 #         destination.parent.mkdir(parents=True, exist_ok=True)
 #         s3_client.download_file(bucket_name, key, str(destination))
         
@@ -68,6 +70,49 @@
         
 #     except Exception as e:
 #         logger.error(f"Error downloading from S3: {e}")
+#         raise
+
+# # ============================================================================
+# # Document and Polly Helpers
+# # ============================================================================
+
+# def extract_text_from_docx(file_content: bytes) -> str:
+#     """Extract text from Word document"""
+#     try:
+#         logger.info("Extracting text from Word document...")
+#         doc = docx.Document(io.BytesIO(file_content))
+#         text = "\n".join([paragraph.text for paragraph in doc.paragraphs])
+#         logger.info(f"Extracted {len(text)} characters from document")
+#         return text
+#     except Exception as e:
+#         logger.error(f"Error extracting text from document: {e}")
+#         raise
+
+# def generate_audio_with_polly(text: str, destination: Path) -> None:
+#     """Generate audio from text using AWS Polly"""
+#     try:
+#         logger.info("Generating audio with AWS Polly...")
+#         polly_client = boto3.client('polly', region_name=APIConfig.AWS_REGION)
+        
+#         response = polly_client.synthesize_speech(
+#             Text=text,
+#             OutputFormat='mp3',
+#             VoiceId='Joanna'
+#         )
+        
+#         destination.parent.mkdir(parents=True, exist_ok=True)
+        
+#         with destination.open('wb') as audio_file:
+#             audio_file.write(response['AudioStream'].read())
+        
+#         if not destination.exists():
+#             raise RuntimeError(f"Failed to generate audio with Polly")
+        
+#         file_size = destination.stat().st_size
+#         logger.info(f"Generated audio: {file_size / 1024:.2f} KB")
+        
+#     except Exception as e:
+#         logger.error(f"Error generating audio with Polly: {e}")
 #         raise
 
 # # ============================================================================
@@ -337,14 +382,15 @@
 
 # @app.post("/api/v1/lipsync")
 # async def create_lipsync(
-#     audio: UploadFile = File(..., description="Input audio file"),
+#     document: UploadFile = File(..., description="Input Word document with text"),
+#     video_name: str = Form(..., description="Name of video file in S3 (e.g., reya.mp4)"),
 #     inference_steps: int = Form(20, description="Number of inference steps (default: 20)"),
 #     guidance_scale: float = Form(1.0, description="Guidance scale (default: 1.0)"),
 #     seed: int = Form(1247, description="Random seed (-1 for random)"),
 #     enable_deepcache: bool = Form(False, description="Enable DeepCache optimization")
 # ):
 #     """
-#     Generate lip-synced video from S3 video and uploaded audio.
+#     Generate lip-synced video from S3 video and Word document text.
 #     Returns the processed video file directly for download.
 #     """
 #     request_id = str(uuid.uuid4())[:8]
@@ -352,19 +398,13 @@
     
 #     try:
 #         # ========================================================================
-#         # 1. Validate audio input
+#         # 1. Validate document input
 #         # ========================================================================
         
-#         if not validate_file_extension(audio.filename, APIConfig.ALLOWED_AUDIO_EXTENSIONS):
+#         if not document.filename.lower().endswith('.docx'):
 #             raise HTTPException(
 #                 status_code=400,
-#                 detail=f"Invalid audio format. Allowed: {APIConfig.ALLOWED_AUDIO_EXTENSIONS}"
-#             )
-        
-#         if not validate_file_size(audio, APIConfig.MAX_AUDIO_SIZE_MB):
-#             raise HTTPException(
-#                 status_code=400,
-#                 detail=f"Audio file too large. Max size: {APIConfig.MAX_AUDIO_SIZE_MB}MB"
+#                 detail="Invalid document format. Only .docx files are allowed"
 #             )
         
 #         # ========================================================================
@@ -376,17 +416,17 @@
         
 #         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 #         video_path = base_dir / f"{request_id}_{timestamp}_input.mp4"
-#         audio_path = base_dir / f"{request_id}_{timestamp}_audio{Path(audio.filename).suffix}"
+#         audio_path = base_dir / f"{request_id}_{timestamp}_audio.mp3"
 #         output_path = base_dir / f"{request_id}_{timestamp}_output.mp4"
         
-#         temp_files = [video_path, audio_path, output_path]
+#         temp_files = [video_path, output_path]
         
 #         logger.info(f"[{request_id}] Video path: {video_path}")
 #         logger.info(f"[{request_id}] Audio path: {audio_path}")
 #         logger.info(f"[{request_id}] Output path: {output_path}")
         
 #         # ========================================================================
-#         # 3. Download video from S3 and save audio
+#         # 3. Download video from S3
 #         # ========================================================================
         
 #         logger.info(f"[{request_id}] Downloading video from S3...")
@@ -395,21 +435,44 @@
 #             None,
 #             download_video_from_s3,
 #             APIConfig.S3_BUCKET_NAME,
-#             APIConfig.S3_VIDEO_KEY,
+#             video_name,
 #             video_path
 #         )
         
-#         logger.info(f"[{request_id}] Saving uploaded audio...")
-#         await save_upload_file(audio, audio_path)
-        
-#         # Verify files exist
+#         # Verify video exists
 #         if not video_path.exists():
 #             raise HTTPException(status_code=500, detail=f"Failed to download video from S3")
-#         if not audio_path.exists():
-#             raise HTTPException(status_code=500, detail=f"Failed to save audio file")
         
 #         # ========================================================================
-#         # 4. Run inference
+#         # 4. Extract text from document and generate audio with Polly
+#         # ========================================================================
+        
+#         logger.info(f"[{request_id}] Processing Word document...")
+#         document_content = await document.read()
+        
+#         text = await loop.run_in_executor(
+#             None,
+#             extract_text_from_docx,
+#             document_content
+#         )
+        
+#         if not text.strip():
+#             raise HTTPException(status_code=400, detail="Document contains no text")
+        
+#         logger.info(f"[{request_id}] Generating audio with Polly...")
+#         await loop.run_in_executor(
+#             None,
+#             generate_audio_with_polly,
+#             text,
+#             audio_path
+#         )
+        
+#         # Verify audio exists
+#         if not audio_path.exists():
+#             raise HTTPException(status_code=500, detail=f"Failed to generate audio with Polly")
+        
+#         # ========================================================================
+#         # 5. Run inference
 #         # ========================================================================
         
 #         logger.info(f"[{request_id}] Starting inference...")
@@ -429,7 +492,7 @@
 #         await loop.run_in_executor(None, run_inference)
         
 #         # ========================================================================
-#         # 5. Verify output exists
+#         # 6. Verify output exists
 #         # ========================================================================
         
 #         if not output_path.exists():
@@ -439,7 +502,7 @@
 #             )
         
 #         # ========================================================================
-#         # 6. Return file response
+#         # 7. Return file response
 #         # ========================================================================
         
 #         output_filename = f"lipsync_output_{timestamp}.mp4"
@@ -506,6 +569,7 @@
 
 
 
+
 """
 FastAPI server for LatentSync Lip-Sync API
 Wraps the existing inference pipeline without modifying core logic
@@ -558,6 +622,14 @@ class APIConfig:
     S3_BUCKET_NAME = "prod-video-gen-avatar-storage"
     AWS_REGION = "us-east-1"  # AWS region for S3 and Polly
 
+# Avatar configuration
+AVATAR_CONFIG = {
+    "nova": {"gender": "female", "file": "nova.mp4"},
+    "reya": {"gender": "female", "file": "reya.mp4"},
+    "bob": {"gender": "male", "file": "bob.mp4"},
+    "alice": {"gender": "male", "file": "alice.mp4"},
+}
+
 # ============================================================================
 # S3 Helper
 # ============================================================================
@@ -596,16 +668,58 @@ def extract_text_from_docx(file_content: bytes) -> str:
         logger.error(f"Error extracting text from document: {e}")
         raise
 
-def generate_audio_with_polly(text: str, destination: Path) -> None:
+def translate_text_to_french(text: str) -> str:
+    """Translate English text to French using AWS Translate"""
+    try:
+        logger.info("Translating text to French using AWS Translate...")
+        translate_client = boto3.client('translate', region_name=APIConfig.AWS_REGION)
+        
+        response = translate_client.translate_text(
+            Text=text,
+            SourceLanguageCode='en',
+            TargetLanguageCode='fr'
+        )
+        
+        translated_text = response['TranslatedText']
+        logger.info(f"Translation complete: {len(translated_text)} characters")
+        return translated_text
+        
+    except Exception as e:
+        logger.error(f"Error translating text: {e}")
+        raise
+
+def get_polly_voice(avatar_name: str, language: str) -> str:
+    """Get appropriate Polly voice based on avatar and language"""
+    avatar_config = AVATAR_CONFIG.get(avatar_name.lower())
+    if not avatar_config:
+        raise ValueError(f"Invalid avatar name: {avatar_name}")
+    
+    gender = avatar_config["gender"]
+    language = language.lower()
+    
+    if gender == "female":
+        if language == "english":
+            return "Danielle"
+        elif language == "french":
+            return "Lea"
+    elif gender == "male":
+        if language == "english":
+            return "Gregory"
+        elif language == "french":
+            return "Remi"
+    
+    raise ValueError(f"Invalid language or gender combination: {language}, {gender}")
+
+def generate_audio_with_polly(text: str, voice_id: str, destination: Path) -> None:
     """Generate audio from text using AWS Polly"""
     try:
-        logger.info("Generating audio with AWS Polly...")
+        logger.info(f"Generating audio with AWS Polly using voice: {voice_id}...")
         polly_client = boto3.client('polly', region_name=APIConfig.AWS_REGION)
         
         response = polly_client.synthesize_speech(
             Text=text,
             OutputFormat='mp3',
-            VoiceId='Joanna'
+            VoiceId=voice_id
         )
         
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -891,7 +1005,8 @@ async def health_check():
 @app.post("/api/v1/lipsync")
 async def create_lipsync(
     document: UploadFile = File(..., description="Input Word document with text"),
-    video_name: str = Form(..., description="Name of video file in S3 (e.g., reya.mp4)"),
+    avatar: str = Form(..., description="Avatar name (nova, reya, bob, alice)"),
+    language: str = Form(..., description="Language (english or french)"),
     inference_steps: int = Form(20, description="Number of inference steps (default: 20)"),
     guidance_scale: float = Form(1.0, description="Guidance scale (default: 1.0)"),
     seed: int = Form(1247, description="Random seed (-1 for random)"),
@@ -906,13 +1021,29 @@ async def create_lipsync(
     
     try:
         # ========================================================================
-        # 1. Validate document input
+        # 1. Validate inputs
         # ========================================================================
         
         if not document.filename.lower().endswith('.docx'):
             raise HTTPException(
                 status_code=400,
                 detail="Invalid document format. Only .docx files are allowed"
+            )
+        
+        # Validate avatar
+        avatar = avatar.lower()
+        if avatar not in AVATAR_CONFIG:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid avatar. Must be one of: {', '.join(AVATAR_CONFIG.keys())}"
+            )
+        
+        # Validate language
+        language = language.lower()
+        if language not in ["english", "french"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid language. Must be 'english' or 'french'"
             )
         
         # ========================================================================
@@ -934,16 +1065,17 @@ async def create_lipsync(
         logger.info(f"[{request_id}] Output path: {output_path}")
         
         # ========================================================================
-        # 3. Download video from S3
+        # 3. Download video from S3 using avatar config
         # ========================================================================
         
-        logger.info(f"[{request_id}] Downloading video from S3...")
+        video_filename = AVATAR_CONFIG[avatar]["file"]
+        logger.info(f"[{request_id}] Downloading video '{video_filename}' for avatar '{avatar}' from S3...")
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(
             None,
             download_video_from_s3,
             APIConfig.S3_BUCKET_NAME,
-            video_name,
+            video_filename,
             video_path
         )
         
@@ -952,7 +1084,7 @@ async def create_lipsync(
             raise HTTPException(status_code=500, detail=f"Failed to download video from S3")
         
         # ========================================================================
-        # 4. Extract text from document and generate audio with Polly
+        # 4. Extract text from document
         # ========================================================================
         
         logger.info(f"[{request_id}] Processing Word document...")
@@ -967,11 +1099,29 @@ async def create_lipsync(
         if not text.strip():
             raise HTTPException(status_code=400, detail="Document contains no text")
         
-        logger.info(f"[{request_id}] Generating audio with Polly...")
+        # ========================================================================
+        # 5. Translate text if language is French
+        # ========================================================================
+        
+        if language == "french":
+            logger.info(f"[{request_id}] Translating text to French...")
+            text = await loop.run_in_executor(
+                None,
+                translate_text_to_french,
+                text
+            )
+        
+        # ========================================================================
+        # 6. Generate audio with Polly using appropriate voice
+        # ========================================================================
+        
+        voice_id = get_polly_voice(avatar, language)
+        logger.info(f"[{request_id}] Generating audio with Polly (voice: {voice_id})...")
         await loop.run_in_executor(
             None,
             generate_audio_with_polly,
             text,
+            voice_id,
             audio_path
         )
         
@@ -980,7 +1130,7 @@ async def create_lipsync(
             raise HTTPException(status_code=500, detail=f"Failed to generate audio with Polly")
         
         # ========================================================================
-        # 5. Run inference
+        # 7. Run inference
         # ========================================================================
         
         logger.info(f"[{request_id}] Starting inference...")
@@ -1000,7 +1150,7 @@ async def create_lipsync(
         await loop.run_in_executor(None, run_inference)
         
         # ========================================================================
-        # 6. Verify output exists
+        # 8. Verify output exists
         # ========================================================================
         
         if not output_path.exists():
@@ -1010,7 +1160,7 @@ async def create_lipsync(
             )
         
         # ========================================================================
-        # 7. Return file response
+        # 9. Return file response
         # ========================================================================
         
         output_filename = f"lipsync_output_{timestamp}.mp4"
